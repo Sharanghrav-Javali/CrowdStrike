@@ -8,11 +8,11 @@
 ![Status](https://img.shields.io/badge/Status-Completed-success?style=for-the-badge)
 ![License](https://img.shields.io/badge/License-MIT-orange?style=for-the-badge)
 
-### YOLO Detection • Gemma Vision Analysis • Human-Reviewed Safety Alerts
+### Gemma 4 Person Detection • Vision Analysis • Human-Reviewed Safety Alerts
 
 ---
 
-Detects people and density in real time with **YOLOv8**. Optionally, **Gemma 4** inspects sampled raw frames, reasons over the visual scene and YOLO measurements, then selects an allowlisted action: continue monitoring or request a human safety-operator review through Telegram.
+Use **Gemma 4** to detect people in sampled camera frames, estimate normalized bounding boxes, and assess crowd safety. YOLOv8 remains available as a faster local detector. Gemma can also select an allowlisted action: continue monitoring or request a human safety-operator review through Telegram.
 
 ⭐ If you like this project, don't forget to star the repository!
 
@@ -22,7 +22,7 @@ Detects people and density in real time with **YOLOv8**. Optionally, **Gemma 4**
 
 # ✨ Features
 
-- 👤 Real-Time Person Detection using YOLOv8
+- 👤 Sampled-frame person detection and boxes using Gemma 4, or local YOLOv8
 - 📊 Live Crowd Counting
 - 🔥 Dynamic Heatmap Generation
 - 🚨 Overcrowding Detection
@@ -45,13 +45,17 @@ Detects people and density in real time with **YOLOv8**. Optionally, **Gemma 4**
 ```text
        Camera / Video
              │
-       ┌─────┴──────────────┐
-       ▼                    ▼
- YOLOv8 detections     Sampled raw frames
-       │                    │
- Counts + heatmap     Gemma 4 vision + reasoning
-       └──────────┬─────────┘
-                  ▼
+       ┌─────┴─────────────┐
+       ▼                   ▼
+ YOLOv8 detector      Gemma 4 vision
+ local / optional     sampled frames
+       │                   │
+       └─────────┬─────────┘
+                 ▼
+         Counts + heatmap
+                 │
+       Gemma safety reasoning
+                 ▼
         Validated action policy
          ┌────────┴─────────┐
          ▼                  ▼
@@ -157,15 +161,17 @@ BOT_TOKEN=your_telegram_bot_token
 CHAT_ID=your_telegram_chat_id
 ```
 
-The Gemini API key enables frame analysis. Telegram credentials enable operator notifications and the existing threshold alerts. Run:
+The Gemini API key enables frame analysis. Telegram credentials enable operator notifications and the existing threshold alerts. To use Gemma as the person detector, run:
 
 ```bash
-python detect_final.py --video crowd.mp4 --gemma
+python detect_final.py --video 0 --detector gemma
 ```
 
-The supported API model IDs are `gemma-4-26b-a4b-it` (default) and `gemma-4-31b-it`; choose with `--gemma_model`. `--gemma_interval` controls sampling cadence (default: 10 seconds). API failures skip that analysis and leave the normal YOLO alerts running.
+Gemma returns estimated person boxes from sampled images. The default sampling interval in Gemma detector mode is 2 seconds; each request sends a camera frame to Google's API and detection updates depend on API latency. Counts and boxes may be less consistent than YOLO and are not a real-time safety guarantee. Older Gemma boxes are marked stale and excluded from counts. API failures leave the video display running; in Gemma detector mode, detection counts pause until a new result arrives.
 
-Gemma 4 does not have a 9B variant. Google lists 9B under Gemma 2; the current Gemma 4 family includes E2B, E4B, 12B, 26B A4B, and 31B variants. Gemma is an advisory layer here, not a replacement for the real-time YOLO person detector.
+The supported API model IDs are `gemma-4-26b-a4b-it` (default) and `gemma-4-31b-it`; choose with `--gemma_model`. For Gemma safety analysis alongside YOLO, use `--detector yolo --gemma --gemma_interval 10`.
+
+Gemma 4 does not have a 9B variant. Google lists 9B under Gemma 2; the current Gemma 4 family includes E2B, E4B, 12B, 26B A4B, and 31B variants. Use YOLO when you need local, frame-by-frame detection; Gemma mode is sampled and API-dependent.
 
 ---
 
@@ -179,9 +185,10 @@ Gemma 4 does not have a 9B variant. Google lists 9B under Gemma 2; the current G
 | --grid | Grid Size |
 | --hot | High Density Threshold |
 | --max_people | Overcrowding Threshold |
-| --gemma | Enable Gemma vision analysis and allowlisted operator-notification actions (requires `GEMINI_API_KEY`) |
+| --detector | Person detector: `gemma` (sampled API vision) or `yolo` (local real-time detection; default) |
+| --gemma | Add Gemma vision review and allowlisted operator-notification actions alongside YOLO |
 | --gemma_model | Gemma API model ID (default: `gemma-4-26b-a4b-it`) |
-| --gemma_interval | Seconds between sampled image analyses (default: `10`) |
+| --gemma_interval | Seconds between sampled frames (default: 2 for Gemma detector, 10 for YOLO plus Gemma) |
 
 Example
 

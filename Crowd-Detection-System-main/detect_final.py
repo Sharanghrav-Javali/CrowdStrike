@@ -65,10 +65,15 @@ parser.add_argument("--grid",       type=int,   default=4,    help="Grid size N 
 parser.add_argument("--alpha",      type=float, default=0.4,  help="Heatmap opacity (0–1)")
 parser.add_argument("--hot",        type=int,   default=2,    help="People/cell threshold for HIGH DENSITY alert")
 parser.add_argument("--max_people", type=int,   default=20,   help="Total people threshold for OVERCROWD alert")
-parser.add_argument("--gemma", action="store_true", help="Enable sampled Gemma 4 vision analysis and allowlisted safety-operator actions")
-parser.add_argument("--gemma_model", default="gemma-4-26b-a4b-it", help="Gemma model ID used with --gemma")
-parser.add_argument("--gemma_interval", type=float, default=10.0, help="Seconds between Gemma frame analyses (default: 10; calls run in background)")
+parser.add_argument("--detector", choices=("yolo", "gemma"), default="yolo", help="Person detector: YOLO (fast local boxes) or Gemma (sampled cloud vision boxes)")
+parser.add_argument("--gemma", action="store_true", help="Add Gemma 4 vision review/actions alongside YOLO detection")
+parser.add_argument("--gemma_model", default="gemma-4-26b-a4b-it", help="Gemma API model ID used by Gemma features")
+parser.add_argument("--gemma_interval", type=float, default=None, help="Seconds between sampled Gemma frame analyses (default: 2 in Gemma detector mode, otherwise 10)")
 args = parser.parse_args()
+if args.detector == "gemma":
+    args.gemma = True
+if args.gemma_interval is None:
+    args.gemma_interval = 2.0 if args.detector == "gemma" else 10.0
 if args.grid < 1:
     parser.error("--grid must be at least 1")
 if args.hot < 1 or args.max_people < 1:
@@ -104,6 +109,26 @@ GEMMA_SAFETY_TOOLS = [{
         "required": ["severity", "confidence", "observations", "recommended_check"],
     },
 }, {
+    "name": "report_person_detections",
+    "description": "Report each visibly detected person once with a tight bounding box in normalized image coordinates from 0 to 1000, origin at top-left. Return an empty array when no people are visible. Do not guess hidden people.",
+    "parameters": {
+        "type": "OBJECT",
+        "properties": {
+            "people": {
+                "type": "ARRAY",
+                "items": {
+                    "type": "OBJECT",
+                    "properties": {
+                        "x1": {"type": "INTEGER"}, "y1": {"type": "INTEGER"},
+                        "x2": {"type": "INTEGER"}, "y2": {"type": "INTEGER"},
+                    },
+                    "required": ["x1", "y1", "x2", "y2"],
+                },
+            },
+        },
+        "required": ["people"],
+    },
+}, {
     "name": "continue_monitoring",
     "description": "Record that this sampled frame does not warrant an operator notification.",
     "parameters": {"type": "OBJECT", "properties": {"reason": {"type": "STRING"}}, "required": ["reason"]},
@@ -113,16 +138,22 @@ GEMMA_SAFETY_TOOLS = [{
 def analyze_frame_with_gemma(jpeg_bytes: bytes, metrics: dict) -> dict:
     """Inspect one sampled image and return an allowlisted tool request, if any."""
     zones = ", ".join(f"row {r + 1}/col {c + 1}" for r, c in metrics["hot_cells"]) or "none"
+    detection_instruction = (
+        "Always call report_person_detections with normalized boxes for all clearly visible people. "
+        if args.detector == "gemma"
+        else "Do not return person boxes; YOLO is the person detector in this mode. "
+    )
     prompt = (
         "Visually assess this sampled crowd-monitoring frame for visible crowding, movement bottlenecks, "
         "possible blocked exits, falls, or other immediately observable safety concerns. Compare visual "
-        "evidence cautiously with these independent detector measurements: "
-        f"YOLO people={metrics['person_count']}; threshold={metrics['max_people']}; "
+        "evidence cautiously with the application's current crowd estimate: "
+        f"people={metrics['person_count']}; threshold={metrics['max_people']}; "
         f"hot grid cells (row/column)={zones}; density threshold={metrics['hot_threshold']}. "
         "Do not infer identity, intent, exact flow direction, injury, or facts hidden from this single frame. "
-        "If evidence or thresholds warrant human attention, call notify_safety_operator with low/moderate/high "
-        "severity, confidence, visible observations, and a check for the operator. Otherwise call "
-        "continue_monitoring. Never recommend automatic crowd-control actions."
+        f"{detection_instruction}"
+        "If evidence or thresholds warrant human attention, also call notify_safety_operator with "
+        "low/moderate/high severity, confidence, visible observations, and a check for the operator. "
+        "Otherwise call continue_monitoring. Never recommend automatic crowd-control actions."
     )
     try:
         image_part = types.Part.from_bytes(data=jpeg_bytes, mime_type="image/jpeg")
@@ -136,18 +167,23 @@ def analyze_frame_with_gemma(jpeg_bytes: bytes, metrics: dict) -> dict:
                     "Your only available actions are the declared tools; never direct physical controls, "
                     "identify people, or claim certainty from one frame."
                 ),
-                tools=[types.Tool(function_declarations=GEMMA_SAFETY_TOOLS)],
+                tools=[types.Tool(function_declarations=[
+                    tool for tool in GEMMA_SAFETY_TOOLS
+                    if args.detector == "gemma" or tool["name"] != "report_person_detections"
+                ])],
                 thinking_config=types.ThinkingConfig(thinking_level="high"),
             ),
         )
         calls = response.function_calls or []
-        if not calls:
-            return {"error": "Gemma returned no allowed safety action."}
-        call = calls[0]
-        result = {"name": call.name, "args": dict(call.args or {})}
-        if result["name"] not in {"notify_safety_operator", "continue_monitoring"}:
-            return {"error": "Gemma requested an unknown tool."}
-        result["person_count"] = metrics["person_count"]
+        result = {"people": None, "safety_action": None, "person_count": metrics["person_count"]}
+        for call in calls:
+            values = dict(call.args or {})
+            if call.name == "report_person_detections":
+                result["people"] = values.get("people", [])
+            elif call.name in {"notify_safety_operator", "continue_monitoring"} and result["safety_action"] is None:
+                result["safety_action"] = {"name": call.name, "args": values}
+        if result["people"] is None:
+            result["detection_error"] = "Gemma returned no person-detection tool result."
         return result
     except Exception as exc:
         return {"error": str(exc)}
@@ -176,7 +212,7 @@ def notify_gemma_action(action: dict, person_count: int) -> bool:
     message = (
         f"🤖 GEMMA VISION REVIEW — HUMAN CHECK REQUESTED\n"
         f"Severity: {severity.upper()} | Confidence: {confidence:.0%}\n"
-        f"YOLO people detected: {person_count}\n"
+        f"People reported by active detector: {person_count}\n"
         f"Visible observations: {observations}\n"
         f"Suggested operator check: {recommended_check}\n"
         "This is an AI advisory, not a verified emergency determination."
@@ -185,17 +221,40 @@ def notify_gemma_action(action: dict, person_count: int) -> bool:
     send_telegram_alert(message)
     return True
 
+
+def validate_gemma_boxes(boxes):
+    """Accept only finite, ordered boxes with normalized 0–1000 coordinates."""
+    if not isinstance(boxes, list):
+        return None
+    valid = []
+    for box in boxes[:100]:
+        if not isinstance(box, dict):
+            continue
+        coords = [box.get(key) for key in ("x1", "y1", "x2", "y2")]
+        if any(isinstance(value, bool) or not isinstance(value, (int, float)) for value in coords):
+            continue
+        x1, y1, x2, y2 = coords
+        if not all(np.isfinite(value) for value in coords):
+            continue
+        if 0 <= x1 < x2 <= 1000 and 0 <= y1 < y2 <= 1000:
+            valid.append({"x1": int(x1), "y1": int(y1), "x2": int(x2), "y2": int(y2)})
+    return valid
+
 PERSON_CLASS_ID = 0
 GRID_N          = args.grid
 
 # ── 2. Load model ─────────────────────────────────────────────────────────────
-print(f"[INFO] Model          : {args.model}")
+print(f"[INFO] Person detector: {args.detector.upper()}")
+if args.detector == "yolo":
+    print(f"[INFO] YOLO weights   : {args.model}")
+else:
+    print(f"[INFO] Gemma model    : {args.gemma_model}")
 print(f"[INFO] Grid           : {GRID_N}×{GRID_N}")
 print(f"[INFO] Heatmap alpha  : {args.alpha}")
 print(f"[INFO] Hot-cell thresh: {args.hot}+ people  →  HIGH DENSITY ZONE")
 print(f"[INFO] Crowd thresh   : {args.max_people}+ people  →  OVERCROWD ALERT")
 print(f"[INFO] Telegram       : {'ENABLED' if BOT_TOKEN and CHAT_ID else 'NOT CONFIGURED'}\n")
-model = YOLO(args.model)
+model = YOLO(args.model) if args.detector == "yolo" else None
 gemma_executor = ThreadPoolExecutor(max_workers=1) if gemma_client else None
 if gemma_executor:
     atexit.register(lambda: gemma_executor.shutdown(wait=False, cancel_futures=True))
@@ -232,6 +291,9 @@ last_telegram_density_time = 0.0   # telegram – high density
 last_gemma_analysis_time = 0.0
 last_gemma_action_time = 0.0
 gemma_future = None
+gemma_boxes = []
+last_gemma_detection_time = 0.0
+has_gemma_detection_result = False
 CONSOLE_COOLDOWN_SEC       = 1.0   # console prints at most every 1 second
 
 
@@ -243,6 +305,35 @@ while True:
         break
 
     now = time.time()
+    if gemma_future and gemma_future.done():
+        try:
+            gemma_result = gemma_future.result()
+        except Exception as exc:
+            gemma_result = {"error": str(exc)}
+        gemma_future = None
+        if "error" in gemma_result:
+            print(f"[GEMMA] Vision analysis unavailable: {gemma_result['error']}")
+        else:
+            checked_boxes = validate_gemma_boxes(gemma_result.get("people"))
+            if checked_boxes is None and args.detector == "gemma":
+                if gemma_result.get("detection_error"):
+                    print(f"[GEMMA] {gemma_result['detection_error']}")
+                else:
+                    print("[GEMMA] Ignored invalid person-detection result.")
+            elif checked_boxes is not None:
+                gemma_boxes = checked_boxes
+                last_gemma_detection_time = now
+                has_gemma_detection_result = True
+            safety_action = gemma_result.get("safety_action")
+            if safety_action:
+                if safety_action.get("name") == "continue_monitoring":
+                    notify_gemma_action(safety_action, gemma_result.get("person_count", 0))
+                elif now - last_gemma_action_time >= GEMMA_ACTION_COOLDOWN_SEC:
+                    if notify_gemma_action(safety_action, gemma_result.get("person_count", 0)):
+                        last_gemma_action_time = now
+                else:
+                    print("[GEMMA] Operator notification suppressed by the 60-second action cooldown.")
+
     should_sample_for_gemma = bool(
         gemma_executor and gemma_future is None and now - last_gemma_analysis_time >= args.gemma_interval
     )
@@ -253,29 +344,44 @@ while True:
     cell_w = max(w // GRID_N, 1)
     cell_h = max(h // GRID_N, 1)
 
-    # ── 4a. YOLOv8 inference ──────────────────────────────────────────────────
-    results      = model(frame, classes=[PERSON_CLASS_ID], conf=args.conf, verbose=False)
     person_count = 0
     grid_counts  = np.zeros((GRID_N, GRID_N), dtype=int)
 
-    for result in results:
-        for box in result.boxes:
-            x1, y1, x2, y2 = map(int, box.xyxy[0])
-            confidence      = float(box.conf[0])
-            person_count   += 1
+    # ── 4a. Person detection ──────────────────────────────────────────────────
+    if args.detector == "yolo":
+        results = model(frame, classes=[PERSON_CLASS_ID], conf=args.conf, verbose=False)
+        people_boxes = []
+        for result in results:
+            for box in result.boxes:
+                x1, y1, x2, y2 = map(int, box.xyxy[0])
+                confidence = float(box.conf[0])
+                people_boxes.append((x1, y1, x2, y2, f"Person {confidence:.0%}", (0, 200, 0)))
+    else:
+        gemma_detection_fresh = now - last_gemma_detection_time <= max(args.gemma_interval * 3, 15)
+        people_boxes = []
+        if gemma_detection_fresh:
+            for box in gemma_boxes:
+                x1 = int(box["x1"] * w / 1000)
+                y1 = int(box["y1"] * h / 1000)
+                x2 = int(box["x2"] * w / 1000)
+                y2 = int(box["y2"] * h / 1000)
+                people_boxes.append((x1, y1, x2, y2, "Gemma person", (0, 165, 255)))
+        else:
+            status = "Gemma detections stale" if has_gemma_detection_result else "Waiting for Gemma detections"
+            cv2.putText(frame, status, (14, 62), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 165, 255), 2)
 
-            # Draw bounding box + label
-            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 200, 0), 2)
-            label_y = y1 - 8 if y1 > 20 else y1 + 20
-            cv2.putText(frame, f"Person {confidence:.0%}", (x1, label_y),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 200, 0), 2)
+    for x1, y1, x2, y2, label, color in people_boxes:
+        person_count += 1
+        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+        label_y = y1 - 8 if y1 > 20 else y1 + 20
+        cv2.putText(frame, label, (x1, label_y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
 
-            # Map person's feet to a grid cell
-            cx  = (x1 + x2) // 2
-            cy  = y2
-            col = min(cx // cell_w, GRID_N - 1)
-            row = min(cy // cell_h, GRID_N - 1)
-            grid_counts[row, col] += 1
+        # Map person's feet to a grid cell.
+        cx = (x1 + x2) // 2
+        cy = y2
+        col = min(cx // cell_w, GRID_N - 1)
+        row = min(cy // cell_h, GRID_N - 1)
+        grid_counts[row, col] += 1
 
     # ── 4b. Alert conditions ──────────────────────────────────────────────────
     overcrowd_alert = person_count >= args.max_people
@@ -299,22 +405,6 @@ while True:
     hot_cells = list(zip(*np.where(grid_counts >= args.hot)))
     send_crowd_telegram = overcrowd_alert and (now - last_telegram_crowd_time) >= TELEGRAM_COOLDOWN_SEC
     send_density_telegram = any_hot_cell and (now - last_telegram_density_time) >= TELEGRAM_COOLDOWN_SEC
-    if gemma_future and gemma_future.done():
-        try:
-            gemma_result = gemma_future.result()
-        except Exception as exc:
-            gemma_result = {"error": str(exc)}
-        gemma_future = None
-        if "error" in gemma_result:
-            print(f"[GEMMA] Vision analysis unavailable: {gemma_result['error']}")
-        elif gemma_result.get("name") == "continue_monitoring":
-            notify_gemma_action(gemma_result, gemma_result.get("person_count", person_count))
-        elif now - last_gemma_action_time >= GEMMA_ACTION_COOLDOWN_SEC:
-            if notify_gemma_action(gemma_result, gemma_result.get("person_count", person_count)):
-                last_gemma_action_time = now
-        else:
-            print("[GEMMA] Operator notification suppressed by the 60-second action cooldown.")
-
     if should_sample_for_gemma and raw_frame is not None:
         analysis_frame = raw_frame
         if analysis_frame.shape[1] > 1280:
