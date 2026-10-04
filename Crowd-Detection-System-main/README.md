@@ -87,6 +87,8 @@ CHAT_ID=your_telegram_chat_id
 
 `GEMINI_API_KEY` is required. `GEMMA_MODEL` defaults to `gemma-4-26b-a4b-it`. Telegram variables are optional; without both, advisories are shown in the console only.
 
+If the window reports a Gemini API error, read the full `[GEMMA]` error in the terminal. The app displays the HTTP status and sanitized API message; common causes are an invalid or blocked key (`401`), missing permission (`403`), unavailable model (`404`), or quota/rate limit (`429`). If a key was pasted into chat, a screenshot, or a public repository, revoke it in Google AI Studio and put a newly created key in `.env` before retrying. Never paste the new key into chat or commit `.env`.
+
 ## Run
 
 Webcam:

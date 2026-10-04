@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from gemma_pipeline import (
     InvalidGemmaResponse,
     calculate_grid,
+    describe_api_error,
     normalized_box_to_pixels,
     parse_gemma_response,
     result_is_fresh,
@@ -42,6 +43,17 @@ class ParseGemmaResponseTests(unittest.TestCase):
         response = SimpleNamespace(function_calls=None, text="{broken")
         with self.assertRaises(InvalidGemmaResponse):
             parse_gemma_response(response)
+
+    def test_api_error_has_actionable_status_and_redacts_key(self):
+        error = SimpleNamespace(
+            code=403,
+            status="PERMISSION_DENIED",
+            message="Key abc123 was reported as leaked.",
+        )
+        message = describe_api_error(error, "abc123")
+        self.assertIn("403 PERMISSION_DENIED", message)
+        self.assertIn("[redacted]", message)
+        self.assertNotIn("abc123", message)
 
 
 class ValidateGemmaAnalysisTests(unittest.TestCase):

@@ -44,6 +44,28 @@ def parse_gemma_response(response) -> dict:
     return _decode_payload(getattr(response, "text", None))
 
 
+def describe_api_error(exc: Exception, api_key: str | None = None) -> str:
+    """Build a short actionable API error without echoing credentials or URLs."""
+    code = getattr(exc, "code", None)
+    status = getattr(exc, "status", None)
+    message = getattr(exc, "message", None)
+    if not message:
+        # SDK API errors expose structured fields; for other errors, class name is
+        # safer than str(exc), which may contain request URLs or auth material.
+        message = type(exc).__name__
+    message = " ".join(str(message).split())
+    if api_key:
+        message = message.replace(api_key, "[redacted]")
+    message = message[:220]
+
+    label = "Gemini API"
+    if code:
+        label += f" {code}"
+    if status:
+        label += f" {status}"
+    return f"{label}: {message}"
+
+
 def validate_analysis(payload) -> dict:
     """Validate all fields before results are used for counts or advisories."""
     data = _decode_payload(payload)

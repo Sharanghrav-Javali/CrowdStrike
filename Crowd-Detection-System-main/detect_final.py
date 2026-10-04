@@ -13,6 +13,7 @@ from dotenv import load_dotenv
 
 from gemma_pipeline import (
     calculate_grid,
+    describe_api_error,
     normalized_box_to_pixels,
     parse_gemma_response,
     result_is_fresh,
@@ -151,8 +152,9 @@ def analyze_frame_with_gemma(jpeg_bytes: bytes, metrics: dict) -> dict:
         )
         return validate_analysis(parse_gemma_response(response))
     except Exception as exc:
-        # Exception messages may contain request URLs or credentials; log only the class.
-        return {"error": type(exc).__name__}
+        # The SDK provides structured status/message fields for API errors. Show
+        # those to help the operator fix the issue, while redacting the API key.
+        return {"error": describe_api_error(exc, GEMINI_API_KEY)}
 
 
 def send_operator_advisory(analysis: dict) -> bool:
@@ -221,13 +223,14 @@ while True:
         try:
             result = gemma_future.result()
         except Exception as exc:
-            result = {"error": type(exc).__name__}
+            result = {"error": describe_api_error(exc, GEMINI_API_KEY)}
         completed_capture_time = gemma_capture_time
         gemma_future = None
         gemma_capture_time = None
         if "error" in result:
             last_analysis_error = result["error"]
-            print(f"[GEMMA] Analysis unavailable ({last_analysis_error}); continuing without detections.")
+            print(f"[GEMMA] Analysis unavailable: {last_analysis_error}")
+            print("[GEMMA] Check the Gemini API key, model access, quota, and network connection.")
         elif result_is_fresh(completed_capture_time, now, MAX_GEMMA_RESULT_AGE_SEC):
             latest_analysis = result
             latest_analysis_capture_time = completed_capture_time
