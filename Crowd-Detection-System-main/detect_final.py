@@ -6,6 +6,14 @@ from concurrent.futures import ThreadPoolExecutor
 import os
 import time
 
+# OpenCV's Linux Qt wheel looks for bundled fonts that are not included in the
+# wheel. Point it at installed system fonts when available to avoid that warning.
+if not os.environ.get("QT_QPA_FONTDIR"):
+    for _font_dir in ("/usr/share/fonts/truetype/dejavu", "/usr/share/fonts"):
+        if os.path.isdir(_font_dir):
+            os.environ["QT_QPA_FONTDIR"] = _font_dir
+            break
+
 import cv2
 import numpy as np
 import requests
@@ -147,7 +155,9 @@ def analyze_frame_with_gemma(jpeg_bytes: bytes, metrics: dict) -> dict:
                     "Use only the declared structured report; do not recommend physical interventions."
                 ),
                 tools=[types.Tool(function_declarations=[ANALYSIS_FUNCTION])],
-                thinking_config=types.ThinkingConfig(thinking_level="high"),
+                # Per-frame crowd analysis benefits more from a quick visual pass
+                # than extended reasoning; this keeps sample latency lower.
+                thinking_config=types.ThinkingConfig(thinking_level="minimal"),
             ),
         )
         return validate_analysis(parse_gemma_response(response))
@@ -207,6 +217,8 @@ gemma_future = None
 gemma_capture_time = None
 latest_analysis = None
 latest_analysis_capture_time = None
+latest_analysis_frame = None
+pending_sample_frame = None
 last_analysis_error = None
 console_cooldown = 1.0
 
@@ -229,46 +241,44 @@ while True:
         gemma_capture_time = None
         if "error" in result:
             last_analysis_error = result["error"]
+            pending_sample_frame = None
             print(f"[GEMMA] Analysis unavailable: {last_analysis_error}")
             print("[GEMMA] Check the Gemini API key, model access, quota, and network connection.")
-        elif result_is_fresh(completed_capture_time, now, MAX_GEMMA_RESULT_AGE_SEC):
+        else:
             latest_analysis = result
             latest_analysis_capture_time = completed_capture_time
+            latest_analysis_frame = pending_sample_frame
+            pending_sample_frame = None
             last_analysis_error = None
+            sample_age = max(0.0, now - completed_capture_time)
             print(
                 f"[GEMMA] {result['people_count']} people estimated; "
-                f"risk={result['risk_level']}; action={result['recommended_action']}"
+                f"risk={result['risk_level']}; action={result['recommended_action']}; "
+                f"sample age={sample_age:.1f}s"
             )
             if (
                 result["recommended_action"] == "notify_safety_operator"
+                and sample_age <= MAX_GEMMA_RESULT_AGE_SEC
                 and now - last_telegram_notification >= TELEGRAM_COOLDOWN_SEC
             ):
                 send_operator_advisory(result)
                 last_telegram_notification = now
-        else:
-            last_analysis_error = "stale_result"
-            print("[GEMMA] Discarded stale sampled-frame result.")
 
     should_sample = gemma_future is None and now - last_analysis_submission >= args.sample_interval
     raw_sample = frame.copy() if should_sample else None
     h, w = frame.shape[:2]
+    analysis_available = latest_analysis is not None and latest_analysis_frame is not None
     analysis_is_fresh = (
         latest_analysis is not None
         and latest_analysis_capture_time is not None
         and result_is_fresh(latest_analysis_capture_time, now, MAX_GEMMA_RESULT_AGE_SEC)
     )
     grid_counts = np.zeros((args.grid, args.grid), dtype=int)
-    pixel_boxes = []
-    if analysis_is_fresh:
+    if analysis_available:
+        analysis_h, analysis_w = latest_analysis_frame.shape[:2]
         grid_counts = np.asarray(
-            calculate_grid(latest_analysis["persons"], w, h, args.grid, args.grid), dtype=int
+            calculate_grid(latest_analysis["persons"], analysis_w, analysis_h, args.grid, args.grid), dtype=int
         )
-        for person in latest_analysis["persons"]:
-            pixel_boxes.append(normalized_box_to_pixels(person["box_2d"], w, h))
-        for x1, y1, x2, y2 in pixel_boxes:
-            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 165, 255), 2)
-            label_y = y1 - 8 if y1 > 20 else y1 + 20
-            cv2.putText(frame, "Gemma person", (x1, label_y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 165, 255), 1)
         person_count = latest_analysis["people_count"]
         risk_level = latest_analysis["risk_level"]
         model_crowding = latest_analysis["crowding_detected"]
@@ -317,54 +327,65 @@ while True:
                 "hot_cells": hot_cells,
             }
             gemma_capture_time = now
+            pending_sample_frame = sample.copy()
             gemma_future = gemma_executor.submit(
                 analyze_frame_with_gemma, jpeg.tobytes(), metrics
             )
             last_analysis_submission = now
             print(f"[GEMMA] Submitted sampled frame; fresh prior count={person_count}.")
 
-    heatmap = np.zeros_like(frame, dtype=np.uint8)
-    max_density = int(grid_counts.max())
-    cell_width = max(w // args.grid, 1)
-    cell_height = max(h // args.grid, 1)
-    for row in range(args.grid):
-        for col in range(args.grid):
-            count = int(grid_counts[row, col])
-            x1, y1 = col * cell_width, row * cell_height
-            x2, y2 = min(x1 + cell_width, w), min(y1 + cell_height, h)
-            cv2.rectangle(heatmap, (x1, y1), (x2, y2), count_to_color(count, max_density), -1)
-            if count:
-                cv2.putText(heatmap, str(count), (x1 + 8, y1 + 24), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2)
-    frame = cv2.addWeighted(frame, 1.0, heatmap, args.alpha, 0)
-
-    for row, col in hot_cells:
-        x1, y1 = col * cell_width, row * cell_height
-        x2, y2 = min(x1 + cell_width, w), min(y1 + cell_height, h)
-        draw_transparent_rect(frame, (x1, y1), (x2, y2), (0, 0, 220), 0.3)
-        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), 3)
-        cv2.putText(frame, "HIGH DENSITY", (x1 + 5, y1 + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 255), 1)
-
-    for line in range(1, args.grid):
-        cv2.line(frame, (line * cell_width, 0), (line * cell_width, h), (220, 220, 220), 1, cv2.LINE_AA)
-        cv2.line(frame, (0, line * cell_height), (w, line * cell_height), (220, 220, 220), 1, cv2.LINE_AA)
-
-    if analysis_is_fresh:
-        age = now - latest_analysis_capture_time
-        status = f"Gemma: {person_count} | risk {risk_level.upper()} | {age:.1f}s old"
-        cv2.putText(frame, status, (14, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2)
-        cv2.putText(frame, latest_analysis["crowd_observation"][:90], (14, 56), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
-    else:
-        status = "Gemma result stale" if latest_analysis is not None else "Waiting for Gemma analysis"
-        if last_analysis_error:
-            status = f"{status}: {last_analysis_error}"
-        cv2.putText(frame, status[:90], (14, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 165, 255), 2)
-
-    if overcrowd_alert:
-        cv2.putText(frame, "CROWD THRESHOLD ADVISORY", (max(w // 3, 10), 90), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+    # Keep the live view separate from the frame Gemma actually analyzed. This
+    # avoids drawing old boxes on a newer frame and lets operators inspect the
+    # model's prediction even if API latency makes the result historical.
+    live_panel = frame.copy()
+    cv2.putText(live_panel, "LIVE CAMERA", (14, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
     telegram_status = "TG: ON" if BOT_TOKEN and CHAT_ID else "TG: CONSOLE ONLY"
-    cv2.putText(frame, telegram_status, (max(w - 190, 10), 30), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+    cv2.putText(live_panel, telegram_status, (14, 58), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+    if overcrowd_alert:
+        cv2.putText(live_panel, "CROWD THRESHOLD ADVISORY", (14, 88), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
 
-    cv2.imshow("Gemma 4 Crowd Safety Monitor", frame)
+    if analysis_available:
+        analysis_panel = latest_analysis_frame.copy()
+        panel_h, panel_w = analysis_panel.shape[:2]
+        overlay = analysis_panel.copy()
+        max_density = max(int(grid_counts.max()), 1)
+        cell_width = max(panel_w // args.grid, 1)
+        cell_height = max(panel_h // args.grid, 1)
+        for row in range(args.grid):
+            for col in range(args.grid):
+                count = int(grid_counts[row, col])
+                x1, y1 = col * cell_width, row * cell_height
+                x2, y2 = min(x1 + cell_width, panel_w), min(y1 + cell_height, panel_h)
+                if count:
+                    color = count_to_color(count, max_density)
+                    cv2.rectangle(overlay, (x1, y1), (x2, y2), color, thickness=-1)
+                    cv2.putText(overlay, str(count), (x1 + 8, y1 + 24), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2)
+        analysis_panel = cv2.addWeighted(overlay, args.alpha, analysis_panel, 1 - args.alpha, 0)
+        for person in latest_analysis["persons"]:
+            x1, y1, x2, y2 = normalized_box_to_pixels(person["box_2d"], panel_w, panel_h)
+            cv2.rectangle(analysis_panel, (x1, y1), (x2, y2), (0, 165, 255), 2)
+            label_y = y1 - 8 if y1 > 20 else y1 + 20
+            cv2.putText(analysis_panel, "Gemma person", (x1, label_y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 165, 255), 1)
+        for line in range(1, args.grid):
+            cv2.line(analysis_panel, (line * cell_width, 0), (line * cell_width, panel_h), (220, 220, 220), 1, cv2.LINE_AA)
+            cv2.line(analysis_panel, (0, line * cell_height), (panel_w, line * cell_height), (220, 220, 220), 1, cv2.LINE_AA)
+        sample_age = max(0.0, now - latest_analysis_capture_time)
+        sample_label = "LATEST SAMPLE" if analysis_is_fresh else "HISTORICAL SAMPLE"
+        cv2.putText(analysis_panel, f"{sample_label} | {sample_age:.1f}s", (14, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2)
+        cv2.putText(analysis_panel, f"People: {person_count} | Risk: {risk_level.upper()}", (14, 58), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        cv2.putText(analysis_panel, latest_analysis["crowd_observation"][:80], (14, 84), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
+    else:
+        analysis_panel = np.zeros_like(frame)
+        waiting_status = "Waiting for Gemma analysis"
+        if last_analysis_error:
+            waiting_status = last_analysis_error[:70]
+        cv2.putText(analysis_panel, waiting_status, (14, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 165, 255), 2)
+
+    panel_width = min(w, 720)
+    panel_height = max(1, int(h * panel_width / w))
+    live_panel = cv2.resize(live_panel, (panel_width, panel_height), interpolation=cv2.INTER_AREA)
+    analysis_panel = cv2.resize(analysis_panel, (panel_width, panel_height), interpolation=cv2.INTER_AREA)
+    cv2.imshow("Gemma 4 Crowd Safety Monitor | Live + Analysis", np.hstack((live_panel, analysis_panel)))
     if cv2.waitKey(1) & 0xFF == ord("q"):
         print("[INFO] Quit signal received.")
         break

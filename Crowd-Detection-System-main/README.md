@@ -45,16 +45,17 @@ Convert boxes → count grid cells → density heatmap
 ## How it works
 
 1. Open a webcam or video file with OpenCV.
-2. Copy an unmodified frame every `--sample-interval` seconds and submit it to a single background worker. No overlapping Gemma requests are made; the video display continues while a request is running.
+2. Copy an unmodified frame every `--sample-interval` seconds and submit it to a single background worker. No overlapping Gemma requests are made; the video display continues while a request is running. Per-frame reasoning uses Gemma's minimal thinking setting to reduce latency.
 3. Send the image and crowd-monitoring prompt to Gemma 4. The model returns a `report_crowd_analysis` function call with machine-readable arguments. If the function call is missing, malformed, or invalid, the frame result is rejected.
 4. Validate the count, each bounding box, risk level, crowding flag, text fields, and recommended action. `people_count` must equal the number of accepted boxes. Allowed risk levels are `low`, `moderate`, and `high`; allowed actions are `continue_monitoring` and `notify_safety_operator`.
 5. Convert each normalized `[ymin, xmin, ymax, xmax]` box (coordinates from 0 to 1000) to frame pixels. The app assigns each box center to a grid cell and calculates the per-cell counts itself.
-6. Display Gemma's current estimate with boxes and a heatmap. If the result is older than 15 seconds, the app marks it stale, excludes its boxes/count from the current frame, and does not show them as current detections.
+6. Show the live camera beside the exact sampled frame Gemma analyzed. The sample pane includes Gemma's boxes, grid heatmap, count, risk, observation, and sample age. Older samples remain visible as historical analysis, never painted over a newer live frame.
 7. Send a human-review advisory if Gemma recommends one or if configured count/density thresholds are reached. All Telegram advisories share a 60-second cooldown.
 
 ## Safety and limitations
 
 - Gemma analyzes **sampled frames**, not every video frame. Results depend on API latency and can lag behind the live scene.
+- Old analysis remains available in the sample pane for inspection, but only results captured within 15 seconds can trigger current alerts.
 - Counts and boxes are model estimates and can be wrong. Invalid or stale outputs are discarded; a temporary API error does not create substitute detections.
 - Camera samples are sent to Google's Gemini API. Use the system only where that data handling is appropriate.
 - Telegram messages are human-review advisories. The application does not control equipment, contact emergency services, or make verified emergency determinations.
